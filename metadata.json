@@ -1,0 +1,6 @@
+{
+  "name": "Generic Medicine Suggestion & Delivery",
+  "description": "Find bioequivalent generic alternatives for branded medicines, compare real-time price savings, and order certified medications with doorstep delivery.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
