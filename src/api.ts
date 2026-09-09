@@ -5,7 +5,10 @@
 
 import type { Medicine, GenericAlternative, CartItem, DeliveryOption, Order } from './types';
 
-const BASE = '/api';
+// In production the frontend is served from a separate static site,
+// so API calls must hit the deployed backend URL.
+// VITE_API_URL e.g. "https://genericmed-api.onrender.com"
+const BASE = import.meta.env.VITE_API_URL ? `${import.meta.env.VITE_API_URL}/api` : '/api';
 
 // ─── Generic fetch wrapper ───────────────────────────────────────────────────
 
