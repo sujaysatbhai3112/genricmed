@@ -4,8 +4,8 @@
  */
 
 import React, { useState } from 'react';
-import { CartItem, DeliveryAddress, DeliverySpeed, Order } from '../types';
-import { deliveryOptions } from '../data/medicineDatabase';
+import { CartItem, DeliveryAddress, DeliverySpeed, DeliveryOption, Order } from '../types';
+import { placeOrder } from '../api';
 import {
   X,
   MapPin,
@@ -14,9 +14,7 @@ import {
   CreditCard,
   ShieldCheck,
   CheckCircle2,
-  PhoneCall,
   Clock,
-  Sparkles,
 } from 'lucide-react';
 
 interface CheckoutModalProps {
@@ -24,6 +22,7 @@ interface CheckoutModalProps {
   onClose: () => void;
   items: CartItem[];
   deliveryPincode: string;
+  deliveryOptions: DeliveryOption[];
   onOrderPlaced: (order: Order) => void;
 }
 
@@ -32,6 +31,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   onClose,
   items,
   deliveryPincode,
+  deliveryOptions,
   onOrderPlaced,
 }) => {
   const [address, setAddress] = useState<DeliveryAddress>({
@@ -49,6 +49,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const [rxOption, setRxOption] = useState<'upload' | 'pharmacist_call' | 'not_needed'>('upload');
   const [paymentMethod, setPaymentMethod] = useState<'cod' | 'card' | 'upi'>('cod');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -58,12 +59,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   );
 
   const selectedDeliveryOption =
-    deliveryOptions.find((d) => d.id === selectedSpeed) || deliveryOptions[0];
+    deliveryOptions.find((d) => d.id === selectedSpeed) ??
+    ({ id: selectedSpeed, name: selectedSpeed, estimatedTime: '', price: 0 } as DeliveryOption);
 
-  const deliveryFee = subtotal > 25 && selectedSpeed === 'standard' ? 0 : selectedDeliveryOption.price;
+  const deliveryFee =
+    subtotal >= 25 && selectedSpeed === 'standard' ? 0 : selectedDeliveryOption.price;
   const grandTotal = subtotal + deliveryFee;
 
-  // Approximate branded baseline to calculate exact savings
   const estimatedBrandedPrice = items.reduce((acc, curr) => {
     const pct = curr.genericAlternative.savingsPercentage || 80;
     const baseBrand = curr.genericAlternative.price / (1 - pct / 100);
@@ -73,39 +75,48 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const totalSavings = Math.max(0, estimatedBrandedPrice - subtotal);
   const requiresRx = items.some((item) => item.rxRequired);
 
-  const handlePlaceOrder = (e: React.FormEvent) => {
+  const handlePlaceOrder = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
+    setSubmitError(null);
 
-    setTimeout(() => {
-      setIsSubmitting(false);
+    try {
+      const idempotencyKey = `order-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 
-      const newOrder: Order = {
-        id: `ORD-GEN-${Math.floor(Math.random() * 899999 + 100000)}`,
-        createdAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        items: [...items],
-        totalAmount: grandTotal,
-        totalSaved: totalSavings,
+      const result = await placeOrder({
+        deliveryAddress: address,
         deliverySpeed: selectedSpeed,
-        deliveryFee,
+        paymentMethod,
+        prescriptionAttached: rxOption === 'upload',
+        idempotencyKey,
+      });
+
+      // Build a full Order object from the API response to pass up
+      const newOrder: Order = {
+        id: result.id,
+        createdAt: result.createdAt,
+        items: [...items],
+        totalAmount: result.totalAmount,
+        totalSaved: result.totalSaved,
+        deliverySpeed: selectedSpeed,
+        deliveryFee: result.deliveryFee,
         deliveryAddress: address,
         paymentMethod,
         status: 'order_placed',
-        prescriptionAttached: rxOption === 'upload',
-        pharmacistName: 'Dr. Emily Vance (Pharm.D)',
-        licenseNumber: 'RPH-849204',
-        estimatedDeliveryTime:
-          selectedSpeed === 'express'
-            ? 'Today in 45-60 minutes'
-            : selectedSpeed === 'same-day'
-            ? 'Today by 8:00 PM'
-            : 'Tomorrow afternoon',
-        riderName: 'Carlos Ramirez',
-        riderPhone: '+1 (555) 902-1144',
+        prescriptionAttached: result.prescriptionAttached,
+        pharmacistName: result.pharmacistName,
+        licenseNumber: result.licenseNumber,
+        estimatedDeliveryTime: result.estimatedDeliveryTime,
+        riderName: result.riderName,
+        riderPhone: result.riderPhone,
       };
 
       onOrderPlaced(newOrder);
-    }, 1200);
+    } catch (err: any) {
+      setSubmitError(err?.message ?? 'Failed to place order. Please try again.');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -129,7 +140,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
           </button>
         </div>
 
-        {/* Modal Form Content */}
+        {/* Form */}
         <form onSubmit={handlePlaceOrder} className="p-6 space-y-6 max-h-[78vh] overflow-y-auto">
           {/* Section 1: Delivery Address */}
           <div className="space-y-3">
@@ -137,7 +148,6 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               <MapPin className="w-4 h-4 text-emerald-600" />
               1. Delivery Address
             </h3>
-
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
               <div>
                 <label className="block text-zinc-600 font-medium mb-1">Full Name</label>
@@ -146,10 +156,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   required
                   value={address.fullName}
                   onChange={(e) => setAddress({ ...address, fullName: e.target.value })}
-                  className="w-full px-3 py-2 border border-zinc-200 rounded-lg bg-zinc-50 focus:bg-white focus:border-emerald-500"
+                  className="w-full px-3 py-2 border border-zinc-200 rounded-lg bg-zinc-50 focus:bg-white focus:border-emerald-500 outline-none"
                 />
               </div>
-
               <div>
                 <label className="block text-zinc-600 font-medium mb-1">Contact Phone</label>
                 <input
@@ -157,10 +166,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   required
                   value={address.phone}
                   onChange={(e) => setAddress({ ...address, phone: e.target.value })}
-                  className="w-full px-3 py-2 border border-zinc-200 rounded-lg bg-zinc-50 focus:bg-white focus:border-emerald-500"
+                  className="w-full px-3 py-2 border border-zinc-200 rounded-lg bg-zinc-50 focus:bg-white focus:border-emerald-500 outline-none"
                 />
               </div>
-
               <div className="sm:col-span-2">
                 <label className="block text-zinc-600 font-medium mb-1">Street Address</label>
                 <input
@@ -168,10 +176,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   required
                   value={address.streetAddress}
                   onChange={(e) => setAddress({ ...address, streetAddress: e.target.value })}
-                  className="w-full px-3 py-2 border border-zinc-200 rounded-lg bg-zinc-50 focus:bg-white focus:border-emerald-500"
+                  className="w-full px-3 py-2 border border-zinc-200 rounded-lg bg-zinc-50 focus:bg-white focus:border-emerald-500 outline-none"
                 />
               </div>
-
               <div>
                 <label className="block text-zinc-600 font-medium mb-1">City</label>
                 <input
@@ -179,10 +186,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   required
                   value={address.city}
                   onChange={(e) => setAddress({ ...address, city: e.target.value })}
-                  className="w-full px-3 py-2 border border-zinc-200 rounded-lg bg-zinc-50 focus:bg-white focus:border-emerald-500"
+                  className="w-full px-3 py-2 border border-zinc-200 rounded-lg bg-zinc-50 focus:bg-white focus:border-emerald-500 outline-none"
                 />
               </div>
-
               <div>
                 <label className="block text-zinc-600 font-medium mb-1">Postal / Zip Code</label>
                 <input
@@ -190,10 +196,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   required
                   value={address.pincode}
                   onChange={(e) => setAddress({ ...address, pincode: e.target.value })}
-                  className="w-full px-3 py-2 border border-zinc-200 rounded-lg bg-zinc-50 focus:bg-white focus:border-emerald-500"
+                  className="w-full px-3 py-2 border border-zinc-200 rounded-lg bg-zinc-50 focus:bg-white focus:border-emerald-500 outline-none"
                 />
               </div>
-
               <div className="sm:col-span-2">
                 <label className="block text-zinc-600 font-medium mb-1">
                   Delivery Notes / Gate Code
@@ -203,7 +208,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   value={address.deliveryNotes || ''}
                   onChange={(e) => setAddress({ ...address, deliveryNotes: e.target.value })}
                   placeholder="e.g. Leave at door, call when arrived"
-                  className="w-full px-3 py-2 border border-zinc-200 rounded-lg bg-zinc-50 focus:bg-white focus:border-emerald-500"
+                  className="w-full px-3 py-2 border border-zinc-200 rounded-lg bg-zinc-50 focus:bg-white focus:border-emerald-500 outline-none"
                 />
               </div>
             </div>
@@ -215,9 +220,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               <Truck className="w-4 h-4 text-emerald-600" />
               2. Select Delivery Speed
             </h3>
-
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-              {deliveryOptions.map((opt) => (
+              {(deliveryOptions.length > 0 ? deliveryOptions : [
+                { id: 'express' as DeliverySpeed, name: 'Express (45 min)', estimatedTime: 'Today in 45-60 minutes', price: 3.99, badge: 'Fastest' },
+                { id: 'same-day' as DeliverySpeed, name: 'Same Day', estimatedTime: 'Today by 8:00 PM', price: 1.99 },
+                { id: 'standard' as DeliverySpeed, name: 'Standard', estimatedTime: 'Tomorrow afternoon', price: 0, badge: 'Free on $25+' },
+              ]).map((opt) => (
                 <button
                   type="button"
                   key={opt.id}
@@ -253,7 +261,6 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 <FileCheck className="w-4 h-4 text-emerald-600" />
                 3. Prescription Verification (Mandatory for Rx Generics)
               </h3>
-
               <div className="space-y-2">
                 <label className="flex items-center gap-3 p-3 rounded-xl border border-zinc-200 bg-zinc-50/50 hover:bg-emerald-50/30 cursor-pointer">
                   <input
@@ -264,15 +271,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                     className="text-emerald-600 focus:ring-emerald-500"
                   />
                   <div className="text-xs">
-                    <strong className="text-zinc-900 block">
-                      Prescription is attached / already uploaded
-                    </strong>
+                    <strong className="text-zinc-900 block">Prescription is attached / already uploaded</strong>
                     <span className="text-zinc-500 text-[11px]">
                       Our pharmacist will verify the active salt and dosage within 10 minutes.
                     </span>
                   </div>
                 </label>
-
                 <label className="flex items-center gap-3 p-3 rounded-xl border border-zinc-200 bg-zinc-50/50 hover:bg-emerald-50/30 cursor-pointer">
                   <input
                     type="radio"
@@ -282,9 +286,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                     className="text-emerald-600 focus:ring-emerald-500"
                   />
                   <div className="text-xs">
-                    <strong className="text-zinc-900 block">
-                      Request Free Call from Registered Pharmacist
-                    </strong>
+                    <strong className="text-zinc-900 block">Request Free Call from Registered Pharmacist</strong>
                     <span className="text-zinc-500 text-[11px]">
                       Our clinical team will call you to discuss your dosage and assist with Rx verification.
                     </span>
@@ -294,56 +296,38 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             </div>
           )}
 
-          {/* Section 4: Payment Method */}
+          {/* Section 4: Payment */}
           <div className="space-y-3 pt-4 border-t border-zinc-200">
             <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-600 flex items-center gap-1.5">
               <CreditCard className="w-4 h-4 text-emerald-600" />
               4. Payment Method
             </h3>
-
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
-              <label className={`p-3 rounded-xl border flex items-center gap-2 cursor-pointer ${
-                paymentMethod === 'cod' ? 'border-emerald-600 bg-emerald-50/60 font-bold text-emerald-950' : 'border-zinc-200'
-              }`}>
-                <input
-                  type="radio"
-                  name="payment"
-                  checked={paymentMethod === 'cod'}
-                  onChange={() => setPaymentMethod('cod')}
-                  className="text-emerald-600"
-                />
-                <span>Cash on Delivery (COD)</span>
-              </label>
-
-              <label className={`p-3 rounded-xl border flex items-center gap-2 cursor-pointer ${
-                paymentMethod === 'card' ? 'border-emerald-600 bg-emerald-50/60 font-bold text-emerald-950' : 'border-zinc-200'
-              }`}>
-                <input
-                  type="radio"
-                  name="payment"
-                  checked={paymentMethod === 'card'}
-                  onChange={() => setPaymentMethod('card')}
-                  className="text-emerald-600"
-                />
-                <span>Credit / Debit Card</span>
-              </label>
-
-              <label className={`p-3 rounded-xl border flex items-center gap-2 cursor-pointer ${
-                paymentMethod === 'upi' ? 'border-emerald-600 bg-emerald-50/60 font-bold text-emerald-950' : 'border-zinc-200'
-              }`}>
-                <input
-                  type="radio"
-                  name="payment"
-                  checked={paymentMethod === 'upi'}
-                  onChange={() => setPaymentMethod('upi')}
-                  className="text-emerald-600"
-                />
-                <span>UPI / Digital Wallet</span>
-              </label>
+              {(['cod', 'card', 'upi'] as const).map((method) => (
+                <label
+                  key={method}
+                  className={`p-3 rounded-xl border flex items-center gap-2 cursor-pointer ${
+                    paymentMethod === method
+                      ? 'border-emerald-600 bg-emerald-50/60 font-bold text-emerald-950'
+                      : 'border-zinc-200'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="payment"
+                    checked={paymentMethod === method}
+                    onChange={() => setPaymentMethod(method)}
+                    className="text-emerald-600"
+                  />
+                  <span>
+                    {method === 'cod' ? 'Cash on Delivery' : method === 'card' ? 'Credit / Debit Card' : 'UPI / Digital Wallet'}
+                  </span>
+                </label>
+              ))}
             </div>
           </div>
 
-          {/* Pricing & Savings Summary Card */}
+          {/* Pricing Summary */}
           <div className="p-4 rounded-xl bg-zinc-900 text-white space-y-2 text-xs">
             <div className="flex justify-between text-zinc-400">
               <span>Items Total (Generic Pricing):</span>
@@ -363,7 +347,14 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             </div>
           </div>
 
-          {/* Submit Action */}
+          {/* API Error */}
+          {submitError && (
+            <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800">
+              {submitError}
+            </div>
+          )}
+
+          {/* Submit */}
           <button
             type="submit"
             disabled={isSubmitting}
@@ -381,6 +372,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               </>
             )}
           </button>
+
+          <div className="text-center text-[10px] text-zinc-400 flex items-center justify-center gap-1">
+            <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+            <span>Secured & Pharmacist-Verified Generic Medicines</span>
+          </div>
         </form>
       </div>
     </div>

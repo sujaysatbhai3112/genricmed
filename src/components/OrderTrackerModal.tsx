@@ -3,21 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React from 'react';
+import React, { useState } from 'react';
 import { Order, OrderStatus } from '../types';
+import { cancelOrder } from '../api';
 import {
-  X,
-  Package,
   CheckCircle2,
-  Clock,
   Truck,
   ShieldCheck,
-  Phone,
-  MapPin,
-  FileCheck,
   ChevronRight,
-  TrendingDown,
-  Pill,
+  XCircle,
+  RefreshCw,
 } from 'lucide-react';
 
 interface OrderTrackerModalProps {
@@ -26,6 +21,7 @@ interface OrderTrackerModalProps {
   onSelectOrder: (order: Order) => void;
   onClose: () => void;
   onAdvanceStatus: (orderId: string) => void;
+  onRefresh: () => Promise<void>;
 }
 
 const statusFlow: { status: OrderStatus; label: string; desc: string }[] = [
@@ -62,7 +58,32 @@ export const OrderTrackerView: React.FC<OrderTrackerModalProps> = ({
   onSelectOrder,
   onClose,
   onAdvanceStatus,
+  onRefresh,
 }) => {
+  const [cancelling, setCancelling] = useState<string | null>(null);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const handleCancel = async (orderId: string) => {
+    if (!window.confirm('Cancel this order?')) return;
+    setCancelling(orderId);
+    setCancelError(null);
+    try {
+      await cancelOrder(orderId);
+      await onRefresh();
+    } catch (err: any) {
+      setCancelError(err?.message ?? 'Failed to cancel order');
+    } finally {
+      setCancelling(null);
+    }
+  };
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    await onRefresh().catch(() => {});
+    setRefreshing(false);
+  };
+
   if (allOrders.length === 0) {
     return (
       <div className="bg-white rounded-2xl border border-zinc-200 p-8 text-center space-y-4 max-w-xl mx-auto my-8">
@@ -97,8 +118,18 @@ export const OrderTrackerView: React.FC<OrderTrackerModalProps> = ({
             </p>
           </div>
 
-          <div className="flex items-center gap-2">
-            {activeOrder.status !== 'delivered' && (
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              onClick={handleRefresh}
+              disabled={refreshing}
+              className="px-3 py-2 bg-white/20 hover:bg-white/30 text-white text-xs font-bold rounded-xl transition-all shadow-xs cursor-pointer flex items-center gap-1.5 disabled:opacity-60"
+              title="Refresh order status"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+              <span>Refresh</span>
+            </button>
+
+            {activeOrder.status !== 'delivered' && activeOrder.status !== 'cancelled' && (
               <button
                 onClick={() => onAdvanceStatus(activeOrder.id)}
                 className="px-3.5 py-2 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 text-xs font-bold rounded-xl transition-all shadow-xs cursor-pointer flex items-center gap-1.5"
@@ -106,6 +137,17 @@ export const OrderTrackerView: React.FC<OrderTrackerModalProps> = ({
               >
                 <span>Simulate Next Step</span>
                 <ChevronRight className="w-4 h-4" />
+              </button>
+            )}
+
+            {['order_placed', 'rx_verified', 'dispensed'].includes(activeOrder.status) && (
+              <button
+                onClick={() => handleCancel(activeOrder.id)}
+                disabled={cancelling === activeOrder.id}
+                className="px-3.5 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold rounded-xl transition-all shadow-xs cursor-pointer flex items-center gap-1.5 disabled:opacity-60"
+              >
+                <XCircle className="w-3.5 h-3.5" />
+                <span>{cancelling === activeOrder.id ? 'Cancelling…' : 'Cancel Order'}</span>
               </button>
             )}
           </div>
@@ -118,10 +160,21 @@ export const OrderTrackerView: React.FC<OrderTrackerModalProps> = ({
           <div className="bg-white rounded-2xl border border-zinc-200 p-6 shadow-xs">
             <h3 className="text-sm font-bold text-zinc-900 mb-6 flex items-center justify-between">
               <span>Delivery Status Timeline</span>
-              <span className="text-xs font-normal text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md">
-                Active Speed: {activeOrder.deliverySpeed.toUpperCase()}
+              <span className={`text-xs font-normal px-2 py-0.5 rounded-md ${
+                activeOrder.status === 'cancelled'
+                  ? 'text-rose-700 bg-rose-50'
+                  : 'text-emerald-700 bg-emerald-50'
+              }`}>
+                {activeOrder.status === 'cancelled' ? 'CANCELLED' : `Active: ${activeOrder.deliverySpeed.toUpperCase()}`}
               </span>
             </h3>
+
+            {cancelError && (
+              <div className="mb-4 p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800 flex items-start gap-2">
+                <XCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{cancelError}</span>
+              </div>
+            )}
 
             <div className="relative pl-6 space-y-8 before:absolute before:left-2.5 before:top-2 before:bottom-2 before:w-0.5 before:bg-zinc-200">
               {statusFlow.map((step, idx) => {

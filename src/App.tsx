@@ -3,15 +3,26 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import {
   Medicine,
   GenericAlternative,
   CartItem,
   Order,
+  DeliveryOption,
   MedicineCategory,
 } from './types';
-import { medicineDatabase, deliveryOptions } from './data/medicineDatabase';
+import {
+  fetchMedicines,
+  fetchDeliveryOptions,
+  addToCart as apiAddToCart,
+  updateCartItem as apiUpdateCartItem,
+  removeCartItem as apiRemoveCartItem,
+  clearCart as apiClearCart,
+  fetchCart,
+  fetchOrders,
+  advanceOrderStatus as apiAdvanceOrderStatus,
+} from './api';
 import { Header } from './components/Header';
 import { MedicineSearch } from './components/MedicineSearch';
 import { MedicineCard } from './components/MedicineCard';
@@ -29,10 +40,8 @@ import {
   FileText,
   AlertCircle,
   Pill,
-  Sparkles,
   TrendingDown,
   Info,
-  Clock,
 } from 'lucide-react';
 
 interface Toast {
@@ -49,102 +58,127 @@ export default function App() {
   const [sortBy, setSortBy] = useState<'savings' | 'price-asc' | 'rating'>('savings');
   const [deliveryPincode, setDeliveryPincode] = useState('10001');
 
-  // Modals & Drawers state
+  // Modals & Drawers
   const [isCartOpen, setIsCartOpen] = useState(false);
   const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
   const [isPharmacistHelpOpen, setIsPharmacistHelpOpen] = useState(false);
   const [selectedDetailMedicine, setSelectedDetailMedicine] = useState<Medicine | null>(null);
 
-  // Cart state initialized with 1 item for immediate visual demonstration
-  const [cart, setCart] = useState<CartItem[]>(() => {
-    const med = medicineDatabase[0];
-    const gen = med.suggestedGenerics[0];
-    return [
-      {
-        id: `cart-${med.id}-${gen.id}`,
-        medicineId: med.id,
-        brandName: med.brandName,
-        genericAlternative: gen,
-        activeIngredient: med.activeIngredient,
-        quantity: 1,
-        rxRequired: med.rxRequired,
-      },
-    ];
-  });
+  // Data from API
+  const [medicines, setMedicines] = useState<Medicine[]>([]);
+  const [medicinesLoading, setMedicinesLoading] = useState(true);
+  const [medicinesError, setMedicinesError] = useState<string | null>(null);
+  const [deliveryOptions, setDeliveryOptions] = useState<DeliveryOption[]>([]);
 
-  // Orders state
+  // Cart state (synced with backend)
+  const [cart, setCart] = useState<CartItem[]>([]);
+  const [cartLoading, setCartLoading] = useState(false);
+
+  // Orders state (synced with backend)
   const [orders, setOrders] = useState<Order[]>([]);
   const [activeOrderForTracker, setActiveOrderForTracker] = useState<Order | null>(null);
 
   // Toasts
   const [toasts, setToasts] = useState<Toast[]>([]);
 
-  const addToast = (message: string, type: 'success' | 'info' | 'error' = 'success') => {
+  const addToast = useCallback((message: string, type: 'success' | 'info' | 'error' = 'success') => {
     const id = Math.random().toString(36).substring(2, 9);
     setToasts((prev) => [...prev, { id, type, message }]);
     setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
     }, 3200);
-  };
+  }, []);
 
-  // Cart Operations
-  const handleAddToCart = (medicine: Medicine, generic: GenericAlternative, quantity: number = 1) => {
-    setCart((prev) => {
-      const existingIdx = prev.findIndex(
-        (item) => item.medicineId === medicine.id && item.genericAlternative.id === generic.id
-      );
+  // ─── Load medicines from API on mount ──────────────────────────────────────
+  useEffect(() => {
+    let cancelled = false;
 
-      if (existingIdx > -1) {
-        const updated = [...prev];
-        updated[existingIdx].quantity += quantity;
-        return updated;
-      } else {
-        const newItem: CartItem = {
-          id: `cart-${medicine.id}-${generic.id}-${Date.now()}`,
-          medicineId: medicine.id,
-          brandName: medicine.brandName,
-          genericAlternative: generic,
-          activeIngredient: medicine.activeIngredient,
-          quantity,
-          rxRequired: medicine.rxRequired,
-        };
-        return [newItem, ...prev];
+    async function load() {
+      try {
+        setMedicinesLoading(true);
+        setMedicinesError(null);
+        const data = await fetchMedicines({ limit: 100 });
+        if (!cancelled) setMedicines(data.medicines);
+      } catch (err) {
+        if (!cancelled) {
+          setMedicinesError('Could not load medicines. Make sure the server is running.');
+          console.error('[App] fetchMedicines error:', err);
+        }
+      } finally {
+        if (!cancelled) setMedicinesLoading(false);
       }
-    });
+    }
 
-    addToast(`Added ${generic.name} to delivery cart`, 'success');
-  };
+    load();
+    return () => { cancelled = true; };
+  }, []);
 
-  const handleAddMultipleToCart = (
+  // ─── Load delivery options on mount ────────────────────────────────────────
+  useEffect(() => {
+    fetchDeliveryOptions()
+      .then((data) => setDeliveryOptions(data.options))
+      .catch((err) => console.error('[App] fetchDeliveryOptions error:', err));
+  }, []);
+
+  // ─── Load cart from API on mount ────────────────────────────────────────────
+  useEffect(() => {
+    fetchCart()
+      .then((data) => setCart(data.items))
+      .catch((err) => console.error('[App] fetchCart error:', err));
+  }, []);
+
+  // ─── Load orders from API on mount ──────────────────────────────────────────
+  const refreshOrders = useCallback(async () => {
+    try {
+      const data = await fetchOrders();
+      setOrders(data.orders);
+      if (data.orders.length > 0 && !activeOrderForTracker) {
+        setActiveOrderForTracker(data.orders[0]);
+      }
+    } catch (err) {
+      console.error('[App] fetchOrders error:', err);
+    }
+  }, [activeOrderForTracker]);
+
+  useEffect(() => {
+    refreshOrders();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ─── Cart Operations (API-backed) ───────────────────────────────────────────
+  const handleAddToCart = useCallback(async (
+    medicine: Medicine,
+    generic: GenericAlternative,
+    quantity: number = 1
+  ) => {
+    try {
+      await apiAddToCart(medicine.id, generic.id, quantity);
+      // Refresh cart from server for accurate state
+      const data = await fetchCart();
+      setCart(data.items);
+      addToast(`Added ${generic.name} to delivery cart`, 'success');
+    } catch (err: any) {
+      addToast(err?.message ?? 'Failed to add item to cart', 'error');
+    }
+  }, [addToast]);
+
+  const handleAddMultipleToCart = useCallback(async (
     items: { medicine: Medicine; generic: GenericAlternative; quantity: number }[]
   ) => {
-    setCart((prev) => {
-      let updated = [...prev];
-      items.forEach(({ medicine, generic, quantity }) => {
-        const existingIdx = updated.findIndex(
-          (item) => item.medicineId === medicine.id && item.genericAlternative.id === generic.id
-        );
-        if (existingIdx > -1) {
-          updated[existingIdx].quantity += quantity;
-        } else {
-          updated.push({
-            id: `cart-${medicine.id}-${generic.id}-${Math.random()}`,
-            medicineId: medicine.id,
-            brandName: medicine.brandName,
-            genericAlternative: generic,
-            activeIngredient: medicine.activeIngredient,
-            quantity,
-            rxRequired: medicine.rxRequired,
-          });
-        }
-      });
-      return updated;
-    });
+    try {
+      // Add all items sequentially to avoid race conditions on the session cart
+      for (const { medicine, generic, quantity } of items) {
+        await apiAddToCart(medicine.id, generic.id, quantity);
+      }
+      const data = await fetchCart();
+      setCart(data.items);
+      addToast(`Added ${items.length} generic substitutes to delivery cart!`, 'success');
+    } catch (err: any) {
+      addToast(err?.message ?? 'Failed to add items to cart', 'error');
+    }
+  }, [addToast]);
 
-    addToast(`Added ${items.length} generic substitutes to delivery cart!`, 'success');
-  };
-
-  const handleUpdateCartQuantity = (id: string, delta: number) => {
+  const handleUpdateCartQuantity = useCallback(async (id: string, delta: number) => {
+    // Optimistic update
     setCart((prev) =>
       prev
         .map((item) => {
@@ -156,30 +190,60 @@ export default function App() {
         })
         .filter(Boolean) as CartItem[]
     );
-  };
 
-  const handleRemoveCartItem = (id: string) => {
+    try {
+      await apiUpdateCartItem(id, delta);
+    } catch (err: any) {
+      // Roll back on failure
+      const data = await fetchCart();
+      setCart(data.items);
+      addToast(err?.message ?? 'Failed to update cart', 'error');
+    }
+  }, [addToast]);
+
+  const handleRemoveCartItem = useCallback(async (id: string) => {
+    // Optimistic update
     setCart((prev) => prev.filter((item) => item.id !== id));
-    addToast('Item removed from delivery cart', 'info');
-  };
+    try {
+      await apiRemoveCartItem(id);
+      addToast('Item removed from delivery cart', 'info');
+    } catch (err: any) {
+      const data = await fetchCart();
+      setCart(data.items);
+      addToast(err?.message ?? 'Failed to remove item', 'error');
+    }
+  }, [addToast]);
 
-  const handleClearCart = () => {
+  const handleClearCart = useCallback(async () => {
     setCart([]);
-  };
+    try {
+      await apiClearCart();
+    } catch (err: any) {
+      const data = await fetchCart();
+      setCart(data.items);
+      addToast(err?.message ?? 'Failed to clear cart', 'error');
+    }
+  }, [addToast]);
 
-  // Order Placement
-  const handleOrderPlaced = (newOrder: Order) => {
-    setOrders((prev) => [newOrder, ...prev]);
+  // ─── Order Placement (called by CheckoutModal after API success) ─────────
+  const handleOrderPlaced = useCallback(async (newOrder: Order) => {
+    // Cart is cleared server-side by the orders route — refresh from API
+    const cartData = await fetchCart().catch(() => ({ items: [] as CartItem[] }));
+    setCart(cartData.items);
+
+    // Refresh orders list
+    const ordersData = await fetchOrders().catch(() => ({ orders: [] as Order[] }));
+    setOrders(ordersData.orders);
     setActiveOrderForTracker(newOrder);
-    setCart([]);
+
     setIsCheckoutOpen(false);
     setIsCartOpen(false);
     setActiveTab('orders');
     addToast(`Order #${newOrder.id} placed! Dispatched for doorstep delivery.`, 'success');
-  };
+  }, [addToast]);
 
-  // Advance Order Status Simulator
-  const handleAdvanceOrderStatus = (orderId: string) => {
+  // ─── Advance Order Status via API ──────────────────────────────────────────
+  const handleAdvanceOrderStatus = useCallback(async (orderId: string) => {
     const statuses: Order['status'][] = [
       'order_placed',
       'rx_verified',
@@ -188,35 +252,36 @@ export default function App() {
       'delivered',
     ];
 
-    setOrders((prev) =>
-      prev.map((ord) => {
-        if (ord.id === orderId) {
-          const currentIndex = statuses.indexOf(ord.status);
-          const nextStatus = statuses[Math.min(statuses.length - 1, currentIndex + 1)];
-          return { ...ord, status: nextStatus };
-        }
-        return ord;
-      })
-    );
+    const order = orders.find((o) => o.id === orderId);
+    if (!order) return;
 
-    addToast('Simulated order progression to next milestone', 'info');
-  };
+    const currentIndex = statuses.indexOf(order.status);
+    const nextStatus = statuses[Math.min(statuses.length - 1, currentIndex + 1)];
+    if (nextStatus === order.status) return;
 
-  // Filter and Sort Medicines
+    try {
+      await apiAdvanceOrderStatus(orderId, nextStatus);
+      // Refresh orders
+      const data = await fetchOrders();
+      setOrders(data.orders);
+      const updated = data.orders.find((o) => o.id === orderId);
+      if (updated) setActiveOrderForTracker(updated);
+      addToast('Order progressed to next milestone', 'info');
+    } catch (err: any) {
+      addToast(err?.message ?? 'Failed to advance order status', 'error');
+    }
+  }, [orders, addToast]);
+
+  // ─── Client-side filter & sort of API-loaded medicines ────────────────────
   const filteredMedicines = useMemo(() => {
-    let list = [...medicineDatabase];
+    let list = [...medicines];
 
-    // Category filter
     if (selectedCategory !== 'all') {
       list = list.filter((m) => m.category === selectedCategory);
     }
-
-    // Prescription toggle
     if (filterRxOnly) {
       list = list.filter((m) => m.rxRequired);
     }
-
-    // Search query
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase().trim();
       list = list.filter(
@@ -225,33 +290,27 @@ export default function App() {
           m.activeIngredient.toLowerCase().includes(q) ||
           m.brandManufacturer.toLowerCase().includes(q) ||
           m.treatmentFor.toLowerCase().includes(q) ||
-          m.suggestedGenerics.some((g) => g.name.toLowerCase().includes(q) || g.manufacturer.toLowerCase().includes(q))
+          m.suggestedGenerics.some(
+            (g) => g.name.toLowerCase().includes(q) || g.manufacturer.toLowerCase().includes(q)
+          )
       );
     }
-
-    // Sort
     list.sort((a, b) => {
       const aGen = a.suggestedGenerics[0];
       const bGen = b.suggestedGenerics[0];
-
+      if (!aGen || !bGen) return 0;
       if (sortBy === 'savings') {
         const aSavingsPct = ((a.brandPrice - aGen.price) / a.brandPrice) * 100;
         const bSavingsPct = ((b.brandPrice - bGen.price) / b.brandPrice) * 100;
         return bSavingsPct - aSavingsPct;
       }
-      if (sortBy === 'price-asc') {
-        return aGen.price - bGen.price;
-      }
-      if (sortBy === 'rating') {
-        return bGen.rating - aGen.rating;
-      }
+      if (sortBy === 'price-asc') return aGen.price - bGen.price;
+      if (sortBy === 'rating') return bGen.rating - aGen.rating;
       return 0;
     });
-
     return list;
-  }, [selectedCategory, filterRxOnly, searchQuery, sortBy]);
+  }, [medicines, selectedCategory, filterRxOnly, searchQuery, sortBy]);
 
-  // Compute total cart savings
   const cartTotalSaved = useMemo(() => {
     return cart.reduce((acc, curr) => {
       const pct = curr.genericAlternative.savingsPercentage || 80;
@@ -288,7 +347,7 @@ export default function App() {
           {/* TAB 1: Search & Generic Suggestion Catalog */}
           {activeTab === 'catalog' && (
             <div className="space-y-6">
-              {/* Value Proposition Hero Banner */}
+              {/* Hero Banner */}
               <div className="bg-gradient-to-r from-emerald-800 via-teal-900 to-emerald-950 text-white rounded-2xl p-6 sm:p-8 shadow-sm">
                 <div className="max-w-3xl">
                   <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-700/80 text-emerald-100 border border-emerald-600/50 mb-3">
@@ -303,7 +362,6 @@ export default function App() {
                     to instantly discover certified generic alternatives manufactured under strict WHO-GMP
                     protocols, delivered directly to your doorstep in temperature-controlled packaging.
                   </p>
-
                   <div className="flex flex-wrap items-center gap-3 mt-4 pt-4 border-t border-emerald-700/60 text-xs text-emerald-200">
                     <span className="flex items-center gap-1">
                       <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> 100% Identical Active Salt Molecule
@@ -323,9 +381,7 @@ export default function App() {
                 selectedCategory={selectedCategory}
                 onSelectCategory={(cat) => setSelectedCategory(cat)}
                 searchQuery={searchQuery}
-                onSelectSuggestedBrand={(brand) => {
-                  setSearchQuery(brand);
-                }}
+                onSelectSuggestedBrand={(brand) => setSearchQuery(brand)}
                 filterRxOnly={filterRxOnly}
                 onToggleFilterRxOnly={() => setFilterRxOnly((v) => !v)}
                 sortBy={sortBy}
@@ -333,43 +389,64 @@ export default function App() {
                 totalResults={filteredMedicines.length}
               />
 
-              {/* Medicine Cards Grid */}
-              {filteredMedicines.length === 0 ? (
-                <div className="bg-white rounded-2xl border border-zinc-200 p-12 text-center space-y-3">
-                  <div className="w-12 h-12 rounded-full bg-zinc-100 flex items-center justify-center text-zinc-400 mx-auto">
-                    <Pill className="w-6 h-6" />
-                  </div>
-                  <h3 className="text-sm font-bold text-zinc-800">No matching medicines found</h3>
-                  <p className="text-xs text-zinc-500 max-w-sm mx-auto">
-                    Try searching by common brand name (e.g., Lipitor, Augmentin, Crocin) or active ingredient (e.g., Atorvastatin, Metformin).
-                  </p>
-                  <button
-                    onClick={() => {
-                      setSearchQuery('');
-                      setSelectedCategory('all');
-                      setFilterRxOnly(false);
-                    }}
-                    className="mt-2 text-xs font-semibold text-emerald-700 hover:text-emerald-800 underline cursor-pointer"
-                  >
-                    Reset all filters
-                  </button>
-                </div>
-              ) : (
+              {/* Loading state */}
+              {medicinesLoading && (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                  {filteredMedicines.map((med) => (
-                    <MedicineCard
-                      key={med.id}
-                      medicine={med}
-                      onAddToCart={handleAddToCart}
-                      onViewDetails={(m) => setSelectedDetailMedicine(m)}
-                    />
+                  {Array.from({ length: 6 }).map((_, i) => (
+                    <div key={i} className="bg-white rounded-2xl border border-zinc-200 p-6 animate-pulse h-56" />
                   ))}
                 </div>
+              )}
+
+              {/* Error state */}
+              {!medicinesLoading && medicinesError && (
+                <div className="bg-rose-50 border border-rose-200 rounded-2xl p-8 text-center space-y-2">
+                  <AlertCircle className="w-8 h-8 text-rose-500 mx-auto" />
+                  <p className="text-sm font-semibold text-rose-800">{medicinesError}</p>
+                  <button
+                    onClick={() => window.location.reload()}
+                    className="text-xs text-rose-700 underline cursor-pointer"
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+
+              {/* Medicine Cards Grid */}
+              {!medicinesLoading && !medicinesError && (
+                filteredMedicines.length === 0 ? (
+                  <div className="bg-white rounded-2xl border border-zinc-200 p-12 text-center space-y-3">
+                    <div className="w-12 h-12 rounded-full bg-zinc-100 flex items-center justify-center text-zinc-400 mx-auto">
+                      <Pill className="w-6 h-6" />
+                    </div>
+                    <h3 className="text-sm font-bold text-zinc-800">No matching medicines found</h3>
+                    <p className="text-xs text-zinc-500 max-w-sm mx-auto">
+                      Try searching by common brand name (e.g., Lipitor, Augmentin, Crocin) or active ingredient (e.g., Atorvastatin, Metformin).
+                    </p>
+                    <button
+                      onClick={() => { setSearchQuery(''); setSelectedCategory('all'); setFilterRxOnly(false); }}
+                      className="mt-2 text-xs font-semibold text-emerald-700 hover:text-emerald-800 underline cursor-pointer"
+                    >
+                      Reset all filters
+                    </button>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    {filteredMedicines.map((med) => (
+                      <MedicineCard
+                        key={med.id}
+                        medicine={med}
+                        onAddToCart={handleAddToCart}
+                        onViewDetails={(m) => setSelectedDetailMedicine(m)}
+                      />
+                    ))}
+                  </div>
+                )
               )}
             </div>
           )}
 
-          {/* TAB 2: Prescription-to-Generic Analyzer */}
+          {/* TAB 2: Prescription Analyzer */}
           {activeTab === 'prescription' && (
             <PrescriptionUploadView
               onAddMultipleToCart={handleAddMultipleToCart}
@@ -377,12 +454,12 @@ export default function App() {
             />
           )}
 
-          {/* TAB 3: Monthly & Annual Savings Calculator */}
+          {/* TAB 3: Savings Calculator */}
           {activeTab === 'calculator' && (
             <SavingsCalculator onAddMultipleToCart={handleAddMultipleToCart} />
           )}
 
-          {/* TAB 4: Orders & Live Delivery Tracker */}
+          {/* TAB 4: Orders & Delivery Tracker */}
           {activeTab === 'orders' && (
             <OrderTrackerView
               order={activeOrderForTracker}
@@ -390,12 +467,13 @@ export default function App() {
               onSelectOrder={(ord) => setActiveOrderForTracker(ord)}
               onClose={() => setActiveTab('catalog')}
               onAdvanceStatus={handleAdvanceOrderStatus}
+              onRefresh={refreshOrders}
             />
           )}
         </main>
       </div>
 
-      {/* Trust & Safety Footer */}
+      {/* Footer */}
       <footer className="mt-12 bg-white border-t border-zinc-200/80 py-8 text-xs text-zinc-500">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 space-y-6">
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
@@ -409,7 +487,6 @@ export default function App() {
                 pharmacopeia purity and dissolution specifications.
               </p>
             </div>
-
             <div className="space-y-2">
               <div className="flex items-center gap-2 text-zinc-900 font-bold text-sm">
                 <Truck className="w-4 h-4 text-emerald-600" />
@@ -420,7 +497,6 @@ export default function App() {
                 90 minutes.
               </p>
             </div>
-
             <div className="space-y-2">
               <div className="flex items-center gap-2 text-zinc-900 font-bold text-sm">
                 <FileText className="w-4 h-4 text-emerald-600" />
@@ -431,7 +507,6 @@ export default function App() {
                 dispensation.
               </p>
             </div>
-
             <div className="space-y-2">
               <div className="flex items-center gap-2 text-zinc-900 font-bold text-sm">
                 <TrendingDown className="w-4 h-4 text-emerald-600" />
@@ -449,17 +524,11 @@ export default function App() {
               © 2026 GenericMed Healthcare Systems Inc. • Certified Pharmacy License #RPH-849204.
             </div>
             <div className="flex items-center gap-4">
-              <button
-                onClick={() => setIsPharmacistHelpOpen(true)}
-                className="hover:text-zinc-600 cursor-pointer"
-              >
+              <button onClick={() => setIsPharmacistHelpOpen(true)} className="hover:text-zinc-600 cursor-pointer">
                 Clinical Disclaimers
               </button>
               <span>•</span>
-              <button
-                onClick={() => setIsPharmacistHelpOpen(true)}
-                className="hover:text-zinc-600 cursor-pointer"
-              >
+              <button onClick={() => setIsPharmacistHelpOpen(true)} className="hover:text-zinc-600 cursor-pointer">
                 Pharmacist Consultation
               </button>
             </div>
@@ -467,7 +536,7 @@ export default function App() {
         </div>
       </footer>
 
-      {/* Cart Slide-Over Drawer */}
+      {/* Cart Drawer */}
       <CartDrawer
         isOpen={isCartOpen}
         onClose={() => setIsCartOpen(false)}
@@ -475,43 +544,35 @@ export default function App() {
         onUpdateQuantity={handleUpdateCartQuantity}
         onRemoveItem={handleRemoveCartItem}
         onClearCart={handleClearCart}
-        onProceedToCheckout={() => {
-          setIsCartOpen(false);
-          setIsCheckoutOpen(true);
-        }}
-        onNavigateToPrescription={() => {
-          setIsCartOpen(false);
-          setActiveTab('prescription');
-        }}
+        onProceedToCheckout={() => { setIsCartOpen(false); setIsCheckoutOpen(true); }}
+        onNavigateToPrescription={() => { setIsCartOpen(false); setActiveTab('prescription'); }}
       />
 
-      {/* Doorstep Delivery Checkout Modal */}
+      {/* Checkout Modal */}
       <CheckoutModal
         isOpen={isCheckoutOpen}
         onClose={() => setIsCheckoutOpen(false)}
         items={cart}
         deliveryPincode={deliveryPincode}
+        deliveryOptions={deliveryOptions}
         onOrderPlaced={handleOrderPlaced}
       />
 
-      {/* Medicine Bioequivalence & Clinical Detail Modal */}
+      {/* Medicine Detail Modal */}
       <MedicineDetailModal
         medicine={selectedDetailMedicine}
         onClose={() => setSelectedDetailMedicine(null)}
         onAddToCart={handleAddToCart}
       />
 
-      {/* Pharmacist Help & Consultation Modal */}
+      {/* Pharmacist Help Modal */}
       <PharmacistHelpModal
         isOpen={isPharmacistHelpOpen}
         onClose={() => setIsPharmacistHelpOpen(false)}
       />
 
       {/* Toast Notifications */}
-      <div
-        id="toast-notifications"
-        className="fixed bottom-5 right-5 z-50 flex flex-col gap-2 pointer-events-none"
-      >
+      <div className="fixed bottom-5 right-5 z-50 flex flex-col gap-2 pointer-events-none">
         {toasts.map((toast) => (
           <div
             key={toast.id}
